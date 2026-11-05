@@ -3234,3 +3234,57 @@ func TestMergeAndMigrateToBoundsIngestedSstPathsOverTruncates(t *testing.T) {
 		}
 	}
 }
+
+type deleteFilesFailingStorage struct {
+	storeapi.Storage
+	fail bool
+}
+
+func (s *deleteFilesFailingStorage) DeleteFiles(ctx context.Context, names []string) error {
+	if s.fail {
+		return errors.New("delete files failed")
+	}
+	return s.Storage.DeleteFiles(ctx, names)
+}
+
+func TestTruncateKeepsMetadataWhenDeleteFails(t *testing.T) {
+	ctx := context.Background()
+	base := tmp(t)
+	metaPath := "v1/backupmeta/0001.meta"
+	dataPath := "v1/log/0001.log"
+	pmt(base, metaPath, &backuppb.Metadata{
+		MetaVersion: backuppb.MetaVersion_V2,
+		MinTs:       1,
+		MaxTs:       5,
+		FileGroups: []*backuppb.DataFileGroup{{
+			Path:  dataPath,
+			MinTs: 1,
+			MaxTs: 5,
+		}},
+	})
+	require.NoError(t, base.WriteFile(ctx, dataPath, []byte("x")))
+
+	metas := StreamMetadataSet{Helper: NewMetadataHelper(), MetadataDownloadBatchSize: 1}
+	require.NoError(t, metas.LoadFrom(ctx, base))
+	s := &deleteFilesFailingStorage{Storage: base, fail: true}
+	notDeleted, err := metas.RemoveDataFilesAndUpdateMetadataInBatch(ctx, 10, s, func(int64) {})
+	require.NoError(t, err)
+	require.Equal(t, []string{dataPath}, notDeleted)
+
+	content, err := base.ReadFile(ctx, metaPath)
+	require.NoError(t, err)
+	var metadata backuppb.Metadata
+	require.NoError(t, metadata.Unmarshal(content))
+	require.Len(t, metadata.FileGroups, 1)
+
+	s.fail = false
+	notDeleted, err = metas.RemoveDataFilesAndUpdateMetadataInBatch(ctx, 10, s, func(int64) {})
+	require.NoError(t, err)
+	require.Empty(t, notDeleted)
+	exists, err := base.FileExists(ctx, dataPath)
+	require.NoError(t, err)
+	require.False(t, exists)
+	exists, err = base.FileExists(ctx, metaPath)
+	require.NoError(t, err)
+	require.False(t, exists)
+}

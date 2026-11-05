@@ -1113,8 +1113,21 @@ func (m MigrationExt) processMetaEdits(ctx context.Context, mig *pb.Migration, o
 		}
 
 		// Firstly delete data so they won't leak when BR crashes.
-		m.cleanUpFor(ctx, medit, out)
-		err := m.applyMetaEdit(ctx, medit)
+		newMetaEdit, err := m.cleanUpFor(ctx, medit)
+		if err != nil {
+			out.Warnings = append(out.Warnings, errors.Annotatef(err, "failed to clean up for meta edit %s", medit.Path))
+			out.NewBase.EditMeta = append(out.NewBase.EditMeta, medit)
+			log.Warn(
+				"Failed to clean up for meta edit.",
+				zap.String("meta-edit", medit.Path),
+				zap.Error(err),
+			)
+			return
+		}
+		if !isEmptyEdition(newMetaEdit) {
+			out.NewBase.EditMeta = append(out.NewBase.EditMeta, newMetaEdit)
+		}
+		err = m.applyMetaEdit(ctx, medit)
 		if err != nil {
 			out.NewBase.EditMeta = append(out.NewBase.EditMeta, medit)
 			out.Warnings = append(out.Warnings, errors.Annotatef(err, "failed to apply meta edit %s to meta file", medit.Path))
@@ -1131,17 +1144,16 @@ func (m MigrationExt) processMetaEdits(ctx context.Context, mig *pb.Migration, o
 
 // cleanUpFor modifies the real storage, remove the log files
 // removed in the meta file, as if the meta edition has been applied.
-func (m MigrationExt) cleanUpFor(ctx context.Context, medit *pb.MetaEdit, out *MigratedTo) {
-	var err error
-	newMetaEdit := &pb.MetaEdit{
-		Path: medit.Path,
-	}
+// It returns the logical deletions that cannot remove a whole physical file,
+// and an error if any physical deletion fails.
+func (m MigrationExt) cleanUpFor(ctx context.Context, medit *pb.MetaEdit) (*pb.MetaEdit, error) {
+	var cleanupErr error
+	newMetaEdit := &pb.MetaEdit{Path: medit.Path}
 
 	if len(medit.DeletePhysicalFiles) > 0 {
-		err = m.s.DeleteFiles(ctx, medit.DeletePhysicalFiles)
+		err := m.s.DeleteFiles(ctx, medit.DeletePhysicalFiles)
 		if err != nil {
-			out.Warnings = append(out.Warnings, errors.Annotate(err, "failed to delete file"))
-			newMetaEdit.DeletePhysicalFiles = slices.Clone(medit.DeletePhysicalFiles)
+			cleanupErr = multierr.Append(cleanupErr, errors.Annotate(err, "failed to delete file"))
 		}
 	}
 
@@ -1154,23 +1166,16 @@ func (m MigrationExt) cleanUpFor(ctx context.Context, medit *pb.MetaEdit, out *M
 		}
 	}
 	if len(physicalFilesToDelete) > 0 {
-		err = m.s.DeleteFiles(ctx, physicalFilesToDelete)
+		err := m.s.DeleteFiles(ctx, physicalFilesToDelete)
 		if err != nil {
-			out.Warnings = append(out.Warnings, errors.Annotate(err, "failed to delete file"))
-			newMetaEdit.DeletePhysicalFiles = append(newMetaEdit.DeletePhysicalFiles, physicalFilesToDelete...)
+			cleanupErr = multierr.Append(cleanupErr, errors.Annotate(err, "failed to delete file"))
 		}
 	}
 
-	if len(out.Warnings) > 0 {
-		log.Warn(
-			"Failed to clean up for meta edit.",
-			zap.String("meta-edit", medit.Path),
-			zap.Errors("warnings", out.Warnings),
-		)
+	if cleanupErr != nil {
+		return nil, cleanupErr
 	}
-	if !isEmptyEdition(newMetaEdit) {
-		out.NewBase.EditMeta = append(out.NewBase.EditMeta, newMetaEdit)
-	}
+	return newMetaEdit, nil
 }
 
 // applyMetaEdit applies the modifications in the `MetaEdit` to the real meta file.
@@ -1519,13 +1524,20 @@ func (m MigrationExt) doTruncateLogs(
 			//
 			// We have already written `truncated-to` to the storage hence
 			// we don't need to worry that the user access files already deleted.
-			aOut := new(MigratedTo)
-			aOut.NewBase = new(pb.Migration)
-			m.cleanUpFor(ctx, me, aOut)
-			updateResult(func(r *MigratedTo) {
-				r.Warnings = append(r.Warnings, aOut.Warnings...)
-				r.NewBase = MergeMigrations(r.NewBase, aOut.NewBase)
-			})
+			newMetaEdit, cleanupErr := m.cleanUpFor(ctx, me)
+			if cleanupErr != nil {
+				updateResult(func(r *MigratedTo) {
+					r.Warnings = append(r.Warnings, errors.Annotatef(cleanupErr, "during handling %s", me.Path))
+					r.NewBase.EditMeta = append(r.NewBase.EditMeta, me)
+				})
+				m.Hooks.DeletedAFileForTruncating(0)
+				return nil
+			}
+			if !isEmptyEdition(newMetaEdit) {
+				updateResult(func(r *MigratedTo) {
+					r.NewBase.EditMeta = append(r.NewBase.EditMeta, newMetaEdit)
+				})
+			}
 
 			err = m.applyMetaEditTo(ctx, me, meta)
 			if err != nil {
